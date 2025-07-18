@@ -1,0 +1,29 @@
+# Use Node.js 20 for development (not Alpine for consistency)
+FROM node:20
+
+# Set working directory
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install all dependencies (including dev dependencies)
+RUN npm ci
+
+# Create non-root user and group for security (Debian-compatible)
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 --gid 1001 nodejs
+
+# Change ownership of the app directory
+RUN chown -R nodejs:nodejs /app
+USER nodejs
+
+# Expose port
+EXPOSE 3001
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:3001/health', (res) => { process.exit(res.statusCode === 200 ? 0 : 1) })"
+
+# Start in development mode (will be overridden by docker-compose.dev.yml)
+CMD ["npm", "run", "dev"] 
