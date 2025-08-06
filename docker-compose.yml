@@ -4,10 +4,11 @@ services:
   ai-backend:
     build: .
     ports:
-      - "3001:3001"
+      - "${AI_BACKEND_PORT:-3001}:${AI_BACKEND_PORT:-3001}"
     environment:
-      - NODE_ENV=development
-      - PORT=3001
+      - NODE_ENV=${NODE_ENV:-development}
+      - PORT=${AI_BACKEND_PORT:-3001}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
     env_file:
       - .env
     volumes:
