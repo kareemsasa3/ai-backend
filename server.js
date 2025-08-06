@@ -1,10 +1,41 @@
 const express = require("express");
 const cors = require("cors");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const client = require("prom-client");
 require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Initialize Prometheus metrics
+const collectDefaultMetrics = client.collectDefaultMetrics;
+collectDefaultMetrics({ prefix: "ai_backend_" });
+
+// Create custom metrics
+const httpRequestDurationMicroseconds = new client.Histogram({
+  name: "http_request_duration_seconds",
+  help: "Duration of HTTP requests in seconds",
+  labelNames: ["method", "route", "status_code"],
+  buckets: [0.1, 0.5, 1, 2, 5],
+});
+
+const httpRequestsTotal = new client.Counter({
+  name: "http_requests_total",
+  help: "Total number of HTTP requests",
+  labelNames: ["method", "route", "status_code"],
+});
+
+const aiChatRequestsTotal = new client.Counter({
+  name: "ai_chat_requests_total",
+  help: "Total number of AI chat requests",
+  labelNames: ["status"],
+});
+
+const aiChatResponseTime = new client.Histogram({
+  name: "ai_chat_response_time_seconds",
+  help: "AI chat response time in seconds",
+  buckets: [0.1, 0.5, 1, 2, 5, 10],
+});
 
 // Initialize Google Generative AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -13,22 +44,55 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 app.use(cors());
 app.use(express.json());
 
+// Metrics middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+
+  res.on("finish", () => {
+    const duration = (Date.now() - start) / 1000;
+    const labels = {
+      method: req.method,
+      route: req.route ? req.route.path : req.path,
+      status_code: res.statusCode,
+    };
+
+    httpRequestDurationMicroseconds.observe(labels, duration);
+    httpRequestsTotal.inc(labels);
+  });
+
+  next();
+});
+
 // Health check endpoint
 app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
+// Metrics endpoint
+app.get("/metrics", async (req, res) => {
+  try {
+    res.set("Content-Type", client.register.contentType);
+    res.end(await client.register.metrics());
+  } catch (ex) {
+    res.status(500).end(ex);
+  }
+});
+
 // Chat endpoint
 app.post("/chat", async (req, res) => {
+  const startTime = Date.now();
+
   try {
     const { message, history, context } = req.body;
 
     if (!message) {
+      aiChatRequestsTotal.inc({ status: "error" });
       return res.status(400).json({ error: "Message is required" });
     }
 
     // Check if Gemini API key is configured
     if (!process.env.GEMINI_API_KEY) {
+      aiChatRequestsTotal.inc({ status: "error" });
       return res.status(500).json({
         error:
           "AI service not configured. Please set GEMINI_API_KEY environment variable.",
@@ -37,10 +101,12 @@ app.post("/chat", async (req, res) => {
 
     // Prepare conversation history for Gemini
     const conversationHistory = history || [];
-    
+
     // Create the model instance
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
-    
+    const model = genAI.getGenerativeModel({
+      model: "gemini-1.5-flash-latest",
+    });
+
     // Start a chat session
     const chat = model.startChat({
       history: conversationHistory.map((msg) => ({
@@ -64,11 +130,19 @@ app.post("/chat", async (req, res) => {
     const response = await result.response;
     const text = response.text();
 
+    const responseTime = (Date.now() - startTime) / 1000;
+    aiChatResponseTime.observe(responseTime);
+    aiChatRequestsTotal.inc({ status: "success" });
+
     res.json({
       response: text,
       timestamp: Date.now(),
     });
   } catch (error) {
+    const responseTime = (Date.now() - startTime) / 1000;
+    aiChatResponseTime.observe(responseTime);
+    aiChatRequestsTotal.inc({ status: "error" });
+
     console.error("AI chat error:", error);
 
     // Provide a helpful error message
@@ -102,10 +176,13 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`AI Backend server running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log(`Metrics endpoint: http://localhost:${PORT}/metrics`);
   console.log(`Chat endpoint: http://localhost:${PORT}/chat`);
 
   if (!process.env.GEMINI_API_KEY) {
-    console.warn("⚠️  No GEMINI_API_KEY configured. Please set the environment variable.");
+    console.warn(
+      "⚠️  No GEMINI_API_KEY configured. Please set the environment variable."
+    );
   } else {
     console.log("✅ Gemini API configured successfully");
   }
