@@ -26,6 +26,10 @@
         "cors": "^2.8.5",
         "dotenv": "^16.3.1",
         "express": "^4.18.2",
+        "helmet": "^7.1.0",
+        "express-rate-limit": "^7.1.5",
+        "ioredis": "^5.4.1",
+        "jsonwebtoken": "^9.0.2",
         "prom-client": "^15.1.3"
     },
     "devDependencies": {
@@ -36,7 +40,7 @@
     },
     "repository": {
         "type": "git",
-        "url": "https://github.com/yourusername/ai-backend.git"
+        "url": "https://github.com/kareemsasa3/ai-backend.git"
     },
-    "homepage": "https://github.com/yourusername/ai-backend#readme"
+    "homepage": "https://github.com/kareemsasa3/ai-backend#readme"
 }

@@ -1,11 +1,27 @@
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const client = require("prom-client");
+const jwt = require("jsonwebtoken");
+const axios = require("axios");
+const Redis = require("ioredis");
 require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const SESSION_TOKEN_SECRET =
+  process.env.SESSION_TOKEN_SECRET || "dev-session-token-secret-change-me";
+const MAX_DAILY_REQUESTS = Number(process.env.AI_DAILY_LIMIT || 50);
+const REDIS_URL = process.env.REDIS_URL || "redis://redis:6379/0";
+const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET || "";
+
+// Redis client (used for per-IP/day quotas)
+const redis = new Redis(REDIS_URL);
+redis.on("error", (err) => {
+  console.error("Redis error:", err);
+});
 
 // Initialize Prometheus metrics
 const collectDefaultMetrics = client.collectDefaultMetrics;
@@ -41,8 +57,30 @@ const aiChatResponseTime = new client.Histogram({
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // Middleware
-app.use(cors());
-app.use(express.json());
+app.use(
+  cors({
+    origin:
+      process.env.NODE_ENV === "production" ? ["https://kareemsasa.dev"] : true,
+    credentials: false,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: [
+      "DNT",
+      "User-Agent",
+      "X-Requested-With",
+      "If-Modified-Since",
+      "Cache-Control",
+      "Content-Type",
+      "Range",
+      "Authorization",
+    ],
+  })
+);
+app.use(helmet());
+app.use(express.json({ limit: "1mb" }));
+
+// Basic rate limiting (second layer; nginx is first layer)
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
+app.use(limiter);
 
 // Metrics middleware
 app.use((req, res, next) => {
@@ -78,12 +116,121 @@ app.get("/metrics", async (req, res) => {
   }
 });
 
+// Utility helpers
+function getClientIp(req) {
+  const xfwd = req.headers["x-forwarded-for"]; // e.g. "client, proxy1, proxy2"
+  if (xfwd) return xfwd.split(",")[0].trim();
+  return req.ip || req.connection?.remoteAddress || "unknown";
+}
+
+function todayKeyForIp(ip) {
+  const now = new Date();
+  const day = `${now.getUTCFullYear()}${String(now.getUTCMonth() + 1).padStart(
+    2,
+    "0"
+  )}${String(now.getUTCDate()).padStart(2, "0")}`;
+  return `ai_quota:${ip}:${day}`;
+}
+
+async function incrementDailyQuota(ip) {
+  const key = todayKeyForIp(ip);
+  const count = await redis.incr(key);
+  if (count === 1) {
+    // set TTL until midnight UTC
+    const now = new Date();
+    const tomorrow = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)
+    );
+    const ttlSeconds = Math.max(60, Math.floor((tomorrow - now) / 1000));
+    await redis.expire(key, ttlSeconds);
+  }
+  return count;
+}
+
+function signSessionToken(payload) {
+  return jwt.sign(payload, SESSION_TOKEN_SECRET, { expiresIn: "1d" });
+}
+
+function verifySessionToken(token) {
+  try {
+    return jwt.verify(token, SESSION_TOKEN_SECRET);
+  } catch (e) {
+    return null;
+  }
+}
+
+// Turnstile verification + session token issuance
+app.post("/auth/turnstile", async (req, res) => {
+  try {
+    const { token } = req.body || {};
+    const ip = getClientIp(req);
+
+    if (process.env.NODE_ENV !== "production" && !TURNSTILE_SECRET) {
+      // Dev fallback: issue a dev token
+      const devToken = signSessionToken({ ip, dev: true, iat: Date.now() });
+      return res.json({ sessionToken: devToken });
+    }
+
+    if (!TURNSTILE_SECRET) {
+      return res.status(503).json({ error: "Turnstile not configured" });
+    }
+
+    if (!token) {
+      return res.status(400).json({ error: "Missing Turnstile token" });
+    }
+
+    const params = new URLSearchParams();
+    params.append("secret", TURNSTILE_SECRET);
+    params.append("response", token);
+    params.append("remoteip", ip);
+
+    const verifyResp = await axios.post(
+      "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+      params,
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+
+    if (!verifyResp.data?.success) {
+      return res.status(401).json({ error: "Turnstile verification failed" });
+    }
+
+    const sessionToken = signSessionToken({ ip });
+    return res.json({ sessionToken });
+  } catch (err) {
+    console.error("Turnstile verification error:", err);
+    return res.status(500).json({ error: "Verification error" });
+  }
+});
+
+// Dev helper to issue a token without Turnstile in non-production
+app.post("/auth/dev-token", (req, res) => {
+  if (process.env.NODE_ENV === "production") {
+    return res.status(404).end();
+  }
+  const ip = getClientIp(req);
+  const sessionToken = signSessionToken({ ip, dev: true });
+  return res.json({ sessionToken });
+});
+
 // Chat endpoint
 app.post("/chat", async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const { message, history, context } = req.body;
+    const { message, history, context } = req.body || {};
+
+    // Require a session token in production when TURNSTILE is configured
+    const authHeader = req.headers["authorization"] || "";
+    const token = authHeader.startsWith("Bearer ")
+      ? authHeader.substring("Bearer ".length)
+      : null;
+    if (process.env.NODE_ENV === "production" && TURNSTILE_SECRET) {
+      const verified = token ? verifySessionToken(token) : null;
+      if (!verified) {
+        aiChatRequestsTotal.inc({ status: "error" });
+        return res.status(401).json({ error: "Unauthorized" });
+      }
+    }
 
     if (!message) {
       aiChatRequestsTotal.inc({ status: "error" });
@@ -99,8 +246,30 @@ app.post("/chat", async (req, res) => {
       });
     }
 
+    // Daily quota enforcement (per IP)
+    const ip = getClientIp(req);
+    let usedToday = 0;
+    try {
+      usedToday = await incrementDailyQuota(ip);
+    } catch (e) {
+      console.warn("Quota check failed; allowing request:", e.message);
+    }
+    if (usedToday > MAX_DAILY_REQUESTS) {
+      aiChatRequestsTotal.inc({ status: "error" });
+      return res
+        .status(429)
+        .json({ error: "Daily message limit reached. Please try tomorrow." });
+    }
+
     // Prepare conversation history for Gemini
-    const conversationHistory = history || [];
+    const conversationHistory = Array.isArray(history)
+      ? history.slice(0, 20).map((m) => ({
+          role: m && m.role === "user" ? "user" : "model",
+          content:
+            typeof m?.content === "string" ? m.content.slice(0, 2000) : "",
+          timestamp: Number.isFinite(m?.timestamp) ? m.timestamp : Date.now(),
+        }))
+      : [];
 
     // Create the model instance
     const model = genAI.getGenerativeModel({
@@ -120,9 +289,12 @@ app.post("/chat", async (req, res) => {
     });
 
     // Add system context if provided
-    let fullMessage = message;
+    let fullMessage = String(message).slice(0, 4000);
     if (context) {
-      fullMessage = `${context}\n\nUser message: ${message}`;
+      fullMessage = `${String(context).slice(
+        0,
+        2000
+      )}\n\nUser message: ${fullMessage}`;
     }
 
     // Generate response
@@ -134,6 +306,7 @@ app.post("/chat", async (req, res) => {
     aiChatResponseTime.observe(responseTime);
     aiChatRequestsTotal.inc({ status: "success" });
 
+    res.setHeader("Cache-Control", "no-store");
     res.json({
       response: text,
       timestamp: Date.now(),
