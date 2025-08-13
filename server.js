@@ -10,6 +10,7 @@ const Redis = require("ioredis");
 require("dotenv").config();
 
 const app = express();
+app.set("trust proxy", true);
 const PORT = process.env.PORT || 3001;
 const SESSION_TOKEN_SECRET =
   process.env.SESSION_TOKEN_SECRET || "dev-session-token-secret-change-me";
@@ -57,30 +58,59 @@ const aiChatResponseTime = new client.Histogram({
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // Middleware
+// Configurable CORS: use env vars if provided, otherwise sensible defaults
+const corsAllowOrigin =
+  process.env.CORS_ALLOW_ORIGIN ||
+  (process.env.NODE_ENV === "production" ? "same-origin" : "*");
+const corsAllowMethods = (process.env.CORS_ALLOW_METHODS || "GET,POST,OPTIONS")
+  .split(/[,\s]+/)
+  .filter(Boolean);
+const corsAllowHeaders = (
+  process.env.CORS_ALLOW_HEADERS ||
+  "DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization"
+)
+  .split(/[,\s]+/)
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin:
-      process.env.NODE_ENV === "production" ? ["https://kareemsasa.dev"] : true,
+    origin: (origin, callback) => {
+      // Allow same-origin and server-to-server requests
+      if (
+        !origin ||
+        corsAllowOrigin === "*" ||
+        corsAllowOrigin === "same-origin"
+      ) {
+        return callback(null, true);
+      }
+      // Support comma-separated origins
+      const allowed = corsAllowOrigin.split(/[,\s]+/).filter(Boolean);
+      if (allowed.includes(origin)) return callback(null, true);
+      return callback(new Error("CORS not allowed"));
+    },
     credentials: false,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: [
-      "DNT",
-      "User-Agent",
-      "X-Requested-With",
-      "If-Modified-Since",
-      "Cache-Control",
-      "Content-Type",
-      "Range",
-      "Authorization",
-    ],
+    methods: corsAllowMethods,
+    allowedHeaders: corsAllowHeaders,
   })
 );
 app.use(helmet());
 app.use(express.json({ limit: "1mb" }));
 
 // Basic rate limiting (second layer; nginx is first layer)
-const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
-app.use(limiter);
+const RATE_LIMIT_WINDOW_MS = Number(
+  process.env.RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000
+);
+const RATE_LIMIT_MAX_REQUESTS = Number(
+  process.env.RATE_LIMIT_MAX_REQUESTS || 100
+);
+const limiter = rateLimit({
+  windowMs: Number.isFinite(RATE_LIMIT_WINDOW_MS)
+    ? RATE_LIMIT_WINDOW_MS
+    : 15 * 60 * 1000,
+  max: Number.isFinite(RATE_LIMIT_MAX_REQUESTS) ? RATE_LIMIT_MAX_REQUESTS : 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // Metrics middleware
 app.use((req, res, next) => {
@@ -213,7 +243,7 @@ app.post("/auth/dev-token", (req, res) => {
 });
 
 // Chat endpoint
-app.post("/chat", async (req, res) => {
+app.post("/chat", limiter, async (req, res) => {
   const startTime = Date.now();
 
   try {
