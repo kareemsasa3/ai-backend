@@ -7,16 +7,33 @@ const client = require("prom-client");
 const jwt = require("jsonwebtoken");
 const axios = require("axios");
 const Redis = require("ioredis");
+const { htmlToText } = require("html-to-text");
+const fs = require("fs");
 require("dotenv").config();
 
 const app = express();
-app.set("trust proxy", true);
+// Trust only the first proxy (e.g., Nginx) to prevent permissive trust proxy issues
+app.set("trust proxy", 1);
 const PORT = process.env.PORT || 3001;
 const SESSION_TOKEN_SECRET =
   process.env.SESSION_TOKEN_SECRET || "dev-session-token-secret-change-me";
 const MAX_DAILY_REQUESTS = Number(process.env.AI_DAILY_LIMIT || 50);
 const REDIS_URL = process.env.REDIS_URL || "redis://redis:6379/0";
 const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET || "";
+const ARACHNE_URL = process.env.ARACHNE_URL || "http://arachne:8080";
+const ARACHNE_API_TOKEN = process.env.ARACHNE_API_TOKEN || "";
+const PROFILE_CONTEXT_PATH = process.env.PROFILE_CONTEXT_PATH || "";
+const PROFILE_CONTEXT_INLINE = process.env.PROFILE_CONTEXT || "";
+const SCRAPE_POLL_MAX_SECONDS = Number(
+  process.env.SCRAPE_POLL_MAX_SECONDS || 75
+);
+const SCRAPE_POLL_INITIAL_MS = Number(
+  process.env.SCRAPE_POLL_INITIAL_MS || 1200
+);
+const SCRAPE_POLL_MAX_MS = Number(process.env.SCRAPE_POLL_MAX_MS || 6000);
+const SCRAPE_POLL_BACKOFF_MULT = Number(
+  process.env.SCRAPE_POLL_BACKOFF_MULT || 1.35
+);
 
 // Redis client (used for per-IP/day quotas)
 const redis = new Redis(REDIS_URL);
@@ -56,6 +73,20 @@ const aiChatResponseTime = new client.Histogram({
 
 // Initialize Google Generative AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Helper: generate text with a custom token budget
+async function generateWithConfig(prompt, maxTokens = 1000, temperature = 0.7) {
+  const model = genAI.getGenerativeModel({
+    model: "gemini-1.5-flash-latest",
+    generationConfig: {
+      maxOutputTokens: maxTokens,
+      temperature,
+    },
+  });
+  const result = await model.generateContent(prompt);
+  const response = result.response;
+  return response.text();
+}
 
 // Middleware
 // Configurable CORS: use env vars if provided, otherwise sensible defaults
@@ -147,6 +178,37 @@ app.get("/metrics", async (req, res) => {
 });
 
 // Utility helpers
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pollScrapeStatus(jobId, headers) {
+  const deadline = Date.now() + SCRAPE_POLL_MAX_SECONDS * 1000;
+  let delay = SCRAPE_POLL_INITIAL_MS;
+  let lastJob = null;
+  while (Date.now() < deadline) {
+    try {
+      const statusResp = await axios.get(
+        `${ARACHNE_URL.replace(/\/$/, "")}/scrape/status`,
+        { params: { id: jobId }, headers, timeout: 10000 }
+      );
+      lastJob = statusResp.data?.job || null;
+      const st = lastJob?.status;
+      if (st === "completed" || st === "failed" || st === "error") {
+        return lastJob;
+      }
+    } catch (e) {
+      // Network or transient error; continue with backoff
+    }
+    await sleep(delay);
+    delay = Math.min(
+      Math.floor(delay * SCRAPE_POLL_BACKOFF_MULT),
+      SCRAPE_POLL_MAX_MS
+    );
+  }
+  return lastJob;
+}
+
 function getClientIp(req) {
   const xfwd = req.headers["x-forwarded-for"]; // e.g. "client, proxy1, proxy2"
   if (xfwd) return xfwd.split(",")[0].trim();
@@ -187,6 +249,29 @@ function verifySessionToken(token) {
   } catch (e) {
     return null;
   }
+}
+
+// Profile context for recruiter fit assessments
+let cachedProfileContext = null;
+function getProfileContext() {
+  if (cachedProfileContext !== null) return cachedProfileContext;
+  try {
+    if (PROFILE_CONTEXT_PATH && fs.existsSync(PROFILE_CONTEXT_PATH)) {
+      cachedProfileContext = fs
+        .readFileSync(PROFILE_CONTEXT_PATH, "utf8")
+        .trim();
+      return cachedProfileContext;
+    }
+  } catch (e) {
+    console.warn("Unable to read PROFILE_CONTEXT_PATH:", e.message);
+  }
+  if (PROFILE_CONTEXT_INLINE) {
+    cachedProfileContext = String(PROFILE_CONTEXT_INLINE);
+  } else {
+    cachedProfileContext =
+      "Kareem Sasa: Senior software engineer experienced in TypeScript, React, Node.js, Go, distributed systems, DevOps (Docker, Compose, Nginx), CI/CD, and system design. Built Workfolio (this portfolio), AI backend integrations, and Arachne (Go-based scraper).";
+  }
+  return cachedProfileContext;
 }
 
 // Turnstile verification + session token issuance
@@ -318,7 +403,7 @@ app.post("/chat", limiter, async (req, res) => {
       },
     });
 
-    // Add system context if provided
+    // Add system context if provided, then always preface with candidate profile
     let fullMessage = String(message).slice(0, 4000);
     if (context) {
       fullMessage = `${String(context).slice(
@@ -326,9 +411,321 @@ app.post("/chat", limiter, async (req, res) => {
         2000
       )}\n\nUser message: ${fullMessage}`;
     }
+    const profileForAllChats = getProfileContext();
+    const fullMessageWithProfile = `Candidate Profile:\n${profileForAllChats.slice(
+      0,
+      8000
+    )}\n\nUser message: ${fullMessage}`;
 
-    // Generate response
-    const result = await chat.sendMessage(fullMessage);
+    // If the user asks to scrape a URL, orchestrate via Arachne
+    const urlRegex = /(https?:\/\/[^\s]+)|(\b[a-z0-9.-]+\.[a-z]{2,}\b)/i;
+    const wantsScrape =
+      /\b(scrape|fetch|get|extract)\b/i.test(fullMessage) &&
+      urlRegex.test(fullMessage);
+    // Recruiter-style fit assessment intent (more permissive detection)
+    const wantsFitAssessment =
+      /\b(qualified|good\s+fit|good\s+candidate|fit)\b/i.test(fullMessage) ||
+      /\b(is\s+kareem|am\s+i)\b[\s\S]*\b(good|qualified|fit)\b/i.test(
+        fullMessage
+      ) ||
+      /\bshould\s+i\s+apply\b/i.test(fullMessage);
+
+    if (wantsFitAssessment || wantsScrape) {
+      // Extract first URL-like token; sanitize punctuation; if missing scheme, prepend https://
+      const stripPunctuation = (s) =>
+        String(s || "")
+          .trim()
+          .replace(/^[“”"'`\(\[\{<]+/, "")
+          .replace(/[””"'`\)\]\}>.,;:!?]+$/, "");
+
+      let match = fullMessage.match(urlRegex);
+      let target = match ? stripPunctuation(match[0]) : null;
+      if (target && !/^https?:\/\//i.test(target)) {
+        target = `https://${target}`;
+      }
+
+      // Detect pasted job text in the current message (regardless of URL presence)
+      let pastedJobText = null;
+      {
+        const raw = fullMessage.replace(/\s+/g, " ");
+        if (raw.length > 600 || /about\s+the\s+job/i.test(fullMessage)) {
+          pastedJobText = fullMessage;
+        }
+      }
+
+      if (target || pastedJobText) {
+        try {
+          const headers = {};
+          if (ARACHNE_API_TOKEN)
+            headers["Authorization"] = `Bearer ${ARACHNE_API_TOKEN}`;
+          let final = null;
+          let jobId = null;
+          if (target) {
+            const createResp = await axios.post(
+              `${ARACHNE_URL.replace(/\/$/, "")}/scrape`,
+              { site_url: target },
+              { headers, timeout: 15000 }
+            );
+            jobId = createResp.data?.job_id;
+
+            // Poll status with exponential backoff up to max duration
+            final = await pollScrapeStatus(jobId, headers);
+          }
+
+          if (final?.status === "completed" || pastedJobText) {
+            // Build raw HTML corpus
+            const results = pastedJobText
+              ? [{ content: pastedJobText }]
+              : Array.isArray(final.results)
+              ? final.results
+              : [];
+            const htmlPieces = results
+              .map((r) => (typeof r?.content === "string" ? r.content : ""))
+              .filter((s) => s && s.length > 0);
+
+            // Chunk safeguards: limit to ~100k chars total
+            const MAX_TOTAL = 100_000;
+            let total = 0;
+            const limitedHtml = [];
+            for (const h of htmlPieces) {
+              if (total >= MAX_TOTAL) break;
+              const remain = MAX_TOTAL - total;
+              const part = h.length > remain ? h.slice(0, remain) : h;
+              limitedHtml.push(part);
+              total += part.length;
+            }
+
+            const combinedHtml = limitedHtml.join("\n\n");
+            let plainText = htmlToText(combinedHtml, {
+              wordwrap: false,
+              selectors: [
+                { selector: "a", options: { ignoreHref: true } },
+                { selector: "img", format: "skip" },
+                { selector: "script", format: "skip" },
+                { selector: "style", format: "skip" },
+              ],
+            });
+
+            // If content is thin (JS-gated pages), consider using pasted job text from chat history
+            let isThinContent = plainText.trim().length < 500;
+            let historyLongUserText = null;
+            if (isThinContent && Array.isArray(history)) {
+              for (let i = history.length - 1; i >= 0; i--) {
+                const m = history[i];
+                if (
+                  m &&
+                  m.role === "user" &&
+                  typeof m.content === "string" &&
+                  m.content.trim().length > 600
+                ) {
+                  historyLongUserText = m.content.trim();
+                  break;
+                }
+              }
+              if (historyLongUserText) {
+                plainText = historyLongUserText.slice(0, 120_000);
+                isThinContent = false;
+              }
+            }
+            const first = results[0] || {};
+            const inferredTitle = (first.title || "").toString().trim();
+            let inferredCompany = "";
+            if (inferredTitle.includes(" - ")) {
+              inferredCompany = inferredTitle.split(" - ")[0].trim();
+            }
+            let inferredDomain = "";
+            try {
+              inferredDomain = new URL(first.url || "").hostname;
+            } catch {}
+
+            // Derive intent: extraction if the user mentions JSON/CSV/fields; else summarization/Q&A
+            const wantsJson = /\b(json|csv|extract|fields?)\b/i.test(
+              fullMessage
+            );
+            const userAsk = message;
+
+            if (!wantsFitAssessment && wantsJson) {
+              const extractionPrompt = [
+                "You are a precise data extraction engine.",
+                "From the provided page content, extract the fields the user asked for.",
+                "Output ONLY a valid JSON array. No prose, no backticks, no comments.",
+                "If a field is missing, omit it rather than inventing values.",
+                "Candidate Profile:",
+                profileForAllChats.slice(0, 8000),
+                "Page content:",
+                plainText.slice(0, 90_000),
+                "\nUser request:",
+                userAsk.slice(0, 1000),
+              ].join("\n\n");
+
+              let jsonText = (
+                await generateWithConfig(extractionPrompt, 1200, 0.4)
+              ).trim();
+              // Attempt to sanitize accidental fencing
+              jsonText = jsonText
+                .replace(/^```(json)?/i, "")
+                .replace(/```$/i, "")
+                .trim();
+
+              const responseTime = (Date.now() - startTime) / 1000;
+              aiChatResponseTime.observe(responseTime);
+              aiChatRequestsTotal.inc({ status: "success" });
+              res.setHeader("Cache-Control", "no-store");
+              return res.json({
+                response: jsonText,
+                jobId: final?.id || null,
+                timestamp: Date.now(),
+              });
+            } else if (!wantsFitAssessment) {
+              if (isThinContent) {
+                const lines = [];
+                if (inferredTitle) lines.push(`Job Title: ${inferredTitle}`);
+                if (inferredCompany) lines.push(`Company: ${inferredCompany}`);
+                if (inferredDomain) lines.push(`Source: ${inferredDomain}`);
+                lines.push(
+                  "Summary: Limited public content; details may require login. Based on the title and source, this appears to be a software role. Paste the full description to get a deeper summary."
+                );
+                const responseTime = (Date.now() - startTime) / 1000;
+                aiChatResponseTime.observe(responseTime);
+                aiChatRequestsTotal.inc({ status: "success" });
+                res.setHeader("Cache-Control", "no-store");
+                return res.json({
+                  response: lines.join("\n"),
+                  jobId: final?.id || null,
+                  timestamp: Date.now(),
+                });
+              }
+              const summaryPrompt = [
+                "You are an assistant that extracts structured details from a job posting. Use ONLY the provided page content.",
+                "Write in third person. Do NOT use first-person (no 'I', 'my').",
+                "Do NOT output shell commands or code blocks. Respond as plain text only.",
+                "Produce a concise, high-signal summary with these sections (omit a section if unavailable):",
+                "- Job Title",
+                "- Company/Site",
+                "- Location / Work Model (onsite/hybrid/remote) and any onsite frequency",
+                "- Seniority Level",
+                "- Required Years of Experience (quote exact text if present)",
+                "- Core Tech/Stack (languages, frameworks, notable platforms)",
+                "- Domain/Industry",
+                "- Responsibilities (5–7 bullets)",
+                "- Hard Requirements (quote exact text)",
+                "- Nice-to-Haves (quote brief text)",
+                "- Benefits/Compensation (if present)",
+                "- Culture/Signals (tone, values)",
+                "- Application Constraints (e.g., US-only, visa, hybrid days)",
+                "- TL;DR (one or two lines)",
+                "Candidate Profile (for context only; do NOT infer beyond page content):",
+                profileForAllChats.slice(0, 8000),
+                "\nJob Page Content:",
+                plainText.slice(0, 90_000),
+                "\nUser request:",
+                userAsk.slice(0, 1000),
+              ].join("\n\n");
+
+              const text2 = await generateWithConfig(summaryPrompt, 1200, 0.6);
+
+              const responseTime = (Date.now() - startTime) / 1000;
+              aiChatResponseTime.observe(responseTime);
+              aiChatRequestsTotal.inc({ status: "success" });
+              res.setHeader("Cache-Control", "no-store");
+              return res.json({
+                response: text2,
+                jobId: final?.id || null,
+                timestamp: Date.now(),
+              });
+            } else {
+              if (isThinContent) {
+                const lines = [];
+                if (inferredTitle) lines.push(`Job Title: ${inferredTitle}`);
+                if (inferredCompany) lines.push(`Company: ${inferredCompany}`);
+                if (inferredDomain) lines.push(`Source: ${inferredDomain}`);
+                lines.push(
+                  "Note: Limited public content; details may require login. Paste the full description for a deeper assessment."
+                );
+                const profile = getProfileContext();
+                lines.push(
+                  "\nPreliminary Fit (based on profile only): Good potential alignment; confirm years of experience and database specifics."
+                );
+                const responseTime = (Date.now() - startTime) / 1000;
+                aiChatResponseTime.observe(responseTime);
+                aiChatRequestsTotal.inc({ status: "success" });
+                res.setHeader("Cache-Control", "no-store");
+                return res.json({
+                  response: lines.join("\n"),
+                  jobId: final?.id || null,
+                  timestamp: Date.now(),
+                });
+              }
+              // Fit assessment using candidate profile + job content
+              const profile = getProfileContext();
+              const fitPrompt = [
+                "You are a recruiter assistant. Evaluate candidate fit using ONLY the provided candidate profile and job content.",
+                "Write in third person about the candidate (Kareem). Do NOT use first-person ('I', 'my').",
+                "Do NOT output shell commands or code blocks. Respond as plain text only.",
+                "First, extract HARD REQUIREMENTS (location/onsite rules, minimum years of experience, specific languages/frameworks/platforms).",
+                "Gating rule: If any hard requirement clearly fails (e.g., 10+ years required and candidate has fewer; Elixir required and candidate lacks it; onsite constraint not met), set Decision Label to 'Not a Fit' and include a 'Blockers' section.",
+                "Return a concise, structured assessment with:",
+                "- Job Title",
+                "- Company/Site",
+                "- Role Summary (1–2 lines)",
+                "- Hard Requirements (quote exact text from job)",
+                "- Hard Requirements Check (Pass/Fail/Unknown with evidence):",
+                "  • Location/Eligibility",
+                "  • Years of Experience",
+                "  • Specific Language/Framework (e.g., Elixir/Phoenix/Erlang if mentioned)",
+                "  • Platform Experience (OpenAI/Anthropic/etc if mentioned)",
+                "  • Core Stack Alignment",
+                "- Responsibilities Highlights (3–6 bullets)",
+                "- Strengths (3–5 bullets with evidence from candidate profile)",
+                "- Gaps (3–5 bullets with evidence and whether trainable)",
+                "- Blockers (only if any hard requirement fails)",
+                "- Fit Score (0–100) and Decision Label: [Strong Fit, Good Fit, Possible Fit, Not a Fit] (apply gating rule)",
+                "- Verdict (short paragraph with rationale)",
+                "- Questions (up to 3) to resolve Unknowns",
+                "Candidate Profile:",
+                profile.slice(0, 8000),
+                "\nJob Content:",
+                plainText.slice(0, 90_000),
+                "\nUser request:",
+                userAsk.slice(0, 1000),
+              ].join("\n\n");
+
+              const text2 = await generateWithConfig(fitPrompt, 1400, 0.6);
+
+              const responseTime = (Date.now() - startTime) / 1000;
+              aiChatResponseTime.observe(responseTime);
+              aiChatRequestsTotal.inc({ status: "success" });
+              res.setHeader("Cache-Control", "no-store");
+              return res.json({
+                response: text2,
+                jobId: final?.id || null,
+                timestamp: Date.now(),
+              });
+            }
+          }
+
+          // Fallback: return job accepted message
+          const text = target
+            ? `Started scraping ${target}. I will post results when ready. Job ID: ${jobId}`
+            : `I can assess fit using the job description. Please share the job URL or paste the job details here.`;
+          const responseTime = (Date.now() - startTime) / 1000;
+          aiChatResponseTime.observe(responseTime);
+          aiChatRequestsTotal.inc({ status: "success" });
+          res.setHeader("Cache-Control", "no-store");
+          return res.json({
+            response: text,
+            jobId: jobId,
+            timestamp: Date.now(),
+          });
+        } catch (e) {
+          console.error("Scrape orchestration error:", e.message);
+          // Fall through to normal chat if orchestration fails
+        }
+      }
+    }
+
+    // Generate response (default) with profile context
+    const result = await chat.sendMessage(fullMessageWithProfile);
     const response = await result.response;
     const text = response.text();
 
