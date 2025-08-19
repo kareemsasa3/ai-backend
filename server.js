@@ -20,6 +20,10 @@ const SESSION_TOKEN_SECRET =
 const MAX_DAILY_REQUESTS = Number(process.env.AI_DAILY_LIMIT || 50);
 const REDIS_URL = process.env.REDIS_URL || "redis://redis:6379/0";
 const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET || "";
+// When set to 'false', Turnstile verification is bypassed and sessions are issued
+// without requiring a Turnstile token. Default is required (true) unless explicitly disabled.
+const TURNSTILE_REQUIRED =
+  (process.env.TURNSTILE_REQUIRED || "true") !== "false";
 const ARACHNE_URL = process.env.ARACHNE_URL || "http://arachne:8080";
 const ARACHNE_API_TOKEN = process.env.ARACHNE_API_TOKEN || "";
 const PROFILE_CONTEXT_PATH = process.env.PROFILE_CONTEXT_PATH || "";
@@ -280,8 +284,18 @@ app.post("/auth/turnstile", async (req, res) => {
     const { token } = req.body || {};
     const ip = getClientIp(req);
 
+    // If Turnstile is not required (explicitly disabled), issue a session token
+    if (!TURNSTILE_REQUIRED) {
+      const bypassToken = signSessionToken({
+        ip,
+        bypass: true,
+        iat: Date.now(),
+      });
+      return res.json({ sessionToken: bypassToken });
+    }
+
+    // In non-production without a secret, issue a dev token
     if (process.env.NODE_ENV !== "production" && !TURNSTILE_SECRET) {
-      // Dev fallback: issue a dev token
       const devToken = signSessionToken({ ip, dev: true, iat: Date.now() });
       return res.json({ sessionToken: devToken });
     }
@@ -319,7 +333,8 @@ app.post("/auth/turnstile", async (req, res) => {
 
 // Dev helper to issue a token without Turnstile in non-production
 app.post("/auth/dev-token", (req, res) => {
-  if (process.env.NODE_ENV === "production") {
+  // Allow dev token in production only if Turnstile is not required
+  if (process.env.NODE_ENV === "production" && TURNSTILE_REQUIRED) {
     return res.status(404).end();
   }
   const ip = getClientIp(req);
@@ -339,7 +354,7 @@ app.post("/chat", limiter, async (req, res) => {
     const token = authHeader.startsWith("Bearer ")
       ? authHeader.substring("Bearer ".length)
       : null;
-    if (process.env.NODE_ENV === "production" && TURNSTILE_SECRET) {
+    if (process.env.NODE_ENV === "production" && TURNSTILE_REQUIRED) {
       const verified = token ? verifySessionToken(token) : null;
       if (!verified) {
         aiChatRequestsTotal.inc({ status: "error" });
