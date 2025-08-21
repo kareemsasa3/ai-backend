@@ -13,7 +13,7 @@ RESOLUTE CONSULTING GROUP LLC | Lead Software Consultant         October 2024 �
 
 Leading full-stack development and providing architectural guidance for enterprise clients in the insurance, energy, and technology sectors. Responsible for project leadership, cloud infrastructure design, and API development.
 
-  Client: Navitas Assurance Partners | Lead Software Architect
+  Client: [REDACTED] | Lead Software Architect
 •	Architected and led the end-to-end development of a full-stack insurance platform from the ground up, establishing a "vertical slice" architecture in both the Next.js/React frontend and the ASP.NET Core 8 backend to accelerate feature delivery.
 •	Provisioned and managed all cloud infrastructure on Azure using Pulumi, engineering a secure environment with an Application Gateway (WAF), Key Vault, and Managed Identities.
 •	Designed a highly resilient API featuring robust authentication (Okta OIDC + JWTs), health checks, rate limiting, Redis caching, and WebSocket integration for real-time messaging.
